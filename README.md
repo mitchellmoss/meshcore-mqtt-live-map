@@ -74,6 +74,7 @@ Runtime tuning:
 - The map can only draw routes for hops that appear in your MQTT feed.
 - To see full paths, the feed must include Path/Trace packets (payload types 8/9) or multiple observers for fanout.
 - Runtime state is persisted to `data/state.json`.
+- Line-of-sight tool: click **LOS tool** and pick two points, or **Shift+click** two nodes to measure LOS between them.
 
 ## License
 [GPL-3.0](https://github.com/yellowcooln/meshcore-mqtt-live-map?tab=License-1-ov-file#).
