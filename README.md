@@ -26,7 +26,7 @@ cp .env.example .env
 ```bash
 docker compose up -d --build
 ```
-4) Open: `http://localhost:8080/`
+4) Open: `http://localhost:8080/` (or your `WEB_PORT`)
 
 ## Configuration (.env)
 Required MQTT settings:
@@ -48,6 +48,7 @@ Site metadata (used in page title + embeds):
 - `SITE_FEED_NOTE`
 
 Runtime tuning:
+- `WEB_PORT` (host port for the web UI)
 - `DEVICE_TTL_SECONDS` (node expiry)
 - `TRAIL_LEN` (points per device trail)
 - `ROUTE_TTL_SECONDS`
