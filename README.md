@@ -67,7 +67,7 @@ Runtime tuning:
 - Runtime state is persisted to `data/state.json`.
 
 ## License
-Add your license here.
+[GPL-3.0](https://github.com/yellowcooln/meshcore-mqtt-live-map?tab=License-1-ov-file#).
 
 ---
 
