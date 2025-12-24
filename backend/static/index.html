@@ -184,6 +184,7 @@
     <button class="map-toggle" id="topo-toggle" type="button">Topo map</button>
     <button class="map-toggle" id="los-toggle" type="button">LOS tool</button>
     <button class="map-toggle" id="prop-toggle" type="button">Propagation</button>
+    <button class="map-toggle" id="nodes-toggle" type="button">Hide nodes</button>
     <div class="prop-panel" id="prop-panel">
       <div class="small"><strong>Propagation estimate</strong></div>
       <div class="small">LoRa 910.525 MHz • BW 62.5 kHz • SF7 • CR8</div>
@@ -198,12 +199,12 @@
         <input id="prop-opacity" type="range" min="0.05" max="0.6" step="0.05" value="0.2" />
       </label>
       <label class="prop-field">
-        <span>Model<span class="prop-hint" title="path-loss environment profile" data-tooltip="path-loss environment profile">?</span></span>
+        <span>Model<span class="prop-hint" title="path-loss environment profile (best-case matches the Meshcore app)" data-tooltip="path-loss environment profile (best-case matches the Meshcore app)">?</span></span>
         <select id="prop-model">
-          <option value="suburban" selected>Suburban</option>
+          <option value="free" selected>Best-case (free-space)</option>
+          <option value="suburban">Suburban</option>
           <option value="urban">Urban</option>
           <option value="indoor">Indoor/obstructed</option>
-          <option value="free">Best-case (free-space)</option>
         </select>
       </label>
       <label class="prop-field">
@@ -236,7 +237,11 @@
       </label>
       <label class="prop-field">
         <span>Multi-origin<span class="prop-hint" title="allow multiple transmitters in one render" data-tooltip="allow multiple transmitters in one render">?</span></span>
-        <input id="prop-multi-origin" type="checkbox" />
+        <input id="prop-multi-origin" type="checkbox" checked />
+      </label>
+      <label class="prop-field">
+        <span>Fade by margin<span class="prop-hint" title="fade coverage by link margin strength" data-tooltip="fade coverage by link margin strength">?</span></span>
+        <input id="prop-fade-margin" type="checkbox" />
       </label>
       <button class="map-toggle" id="prop-clear-origins" type="button">Clear origins</button>
       <label class="prop-field">
@@ -309,6 +314,8 @@
 
     const markers = new Map();   // device_id -> Leaflet marker
     const polylines = new Map(); // device_id -> Leaflet polyline
+    const nodeLayer = L.layerGroup().addTo(map);
+    let nodesVisible = true;
     const routeLines = new Map(); // route_id -> { line, timeout }
     const deviceMeta = new Map(); // device_id -> { lat, lon, name }
     const routeLayer = L.layerGroup().addTo(map);
@@ -385,6 +392,22 @@
 
     function setStats() {
       document.getElementById('stats').textContent = `${markers.size} active devices • ${routeLines.size} routes`;
+    }
+
+    function setNodesVisible(visible) {
+      nodesVisible = visible;
+      const btn = document.getElementById('nodes-toggle');
+      if (btn) {
+        btn.classList.toggle('active', !visible);
+        btn.textContent = visible ? 'Hide nodes' : 'Show nodes';
+      }
+      if (visible) {
+        if (!map.hasLayer(nodeLayer)) {
+          nodeLayer.addTo(map);
+        }
+      } else if (map.hasLayer(nodeLayer)) {
+        map.removeLayer(nodeLayer);
+      }
     }
 
     function setLosStatus(text) {
@@ -468,7 +491,7 @@
       const panel = document.getElementById('prop-panel');
       if (btn) {
         btn.classList.toggle('active', active);
-        btn.textContent = active ? 'Propagation: select node' : 'Propagation';
+        btn.textContent = active ? 'Propagation: select node(s)' : 'Propagation';
       }
       if (panel) {
         panel.classList.toggle('active', active);
@@ -546,12 +569,13 @@
       const rxMslInput = document.getElementById('prop-rx-msl');
       const minRxInput = document.getElementById('prop-min-rx');
       const autoRangeInput = document.getElementById('prop-auto-range');
+      const fadeMarginInput = document.getElementById('prop-fade-margin');
       const autoResInput = document.getElementById('prop-auto-res');
       const maxCellsInput = document.getElementById('prop-max-cells');
       const gridInput = document.getElementById('prop-grid');
       const sampleInput = document.getElementById('prop-sample');
       const rangeFactorInput = document.getElementById('prop-range-factor');
-      if (!txInput || !opacityInput || !modelSelect || !terrainInput || !txAglInput || !rxAglInput || !txMslInput || !rxMslInput || !minRxInput || !autoRangeInput || !autoResInput || !maxCellsInput || !gridInput || !sampleInput || !rangeFactorInput) {
+      if (!txInput || !opacityInput || !modelSelect || !terrainInput || !txAglInput || !rxAglInput || !txMslInput || !rxMslInput || !minRxInput || !autoRangeInput || !fadeMarginInput || !autoResInput || !maxCellsInput || !gridInput || !sampleInput || !rangeFactorInput) {
         return null;
       }
       const txPower = Number(txInput.value);
@@ -564,6 +588,7 @@
       const rxMsl = parseOptionalNumber(rxMslInput.value);
       const minRxDbm = Number(minRxInput.value);
       const autoRange = autoRangeInput.checked;
+      const fadeMargin = fadeMarginInput.checked;
       const autoResolution = autoResInput.checked;
       const maxCells = Number(maxCellsInput.value);
       const gridStep = Number(gridInput.value);
@@ -582,6 +607,7 @@
         rxAgl: Number.isFinite(rxAgl) ? Math.max(0, rxAgl) : 0,
         minRxDbm: Number.isFinite(minRxDbm) ? Math.min(-60, Math.max(-150, minRxDbm)) : -97,
         autoRange,
+        fadeMargin,
         autoResolution,
         maxCells: Number.isFinite(maxCells) ? Math.min(500000, Math.max(20000, maxCells)) : 120000,
         txMsl,
@@ -589,7 +615,7 @@
       };
     }
 
-    function estimatePropagationCost(renderRange, gridStep, sampleStep) {
+    function estimatePropagationCost(renderRange, gridStep, sampleStep, originCount) {
       const latScale = 111320;
       const refLat = propagationOrigins.length
         ? (propagationOrigins.reduce((sum, origin) => sum + origin.lat, 0) / propagationOrigins.length)
@@ -599,21 +625,23 @@
       const cols = Math.max(1, Math.ceil((renderRange * 2) / (gridStep * (lonScale / latScale))));
       const cells = rows * cols;
       const avgSamples = Math.max(2, Math.ceil(renderRange / sampleStep) + 1);
+      const multiplier = Math.max(1, originCount || 1);
       return {
         cells,
-        samples: Math.round(cells * avgSamples)
+        samples: Math.round(cells * avgSamples * multiplier)
       };
     }
 
-    function derivePropagationResolution(config, renderRange) {
+    function derivePropagationResolution(config, renderRange, originCount) {
+      const originFactor = Math.max(1, originCount || 1);
       let gridStep = config.gridStep;
       let sampleStep = config.sampleStep;
-      let estimate = estimatePropagationCost(renderRange, gridStep, sampleStep);
-      if (config.autoResolution && estimate.cells > config.maxCells) {
-        const scale = Math.sqrt(estimate.cells / config.maxCells);
+      let estimate = estimatePropagationCost(renderRange, gridStep, sampleStep, originFactor);
+      if (config.autoResolution && estimate.cells > (config.maxCells / originFactor)) {
+        const scale = Math.sqrt(estimate.cells / (config.maxCells / originFactor));
         gridStep = Math.min(600, Math.max(30, Math.round((gridStep * scale) / 5) * 5));
         sampleStep = Math.min(600, Math.max(30, Math.round((sampleStep * scale) / 5) * 5));
-        estimate = estimatePropagationCost(renderRange, gridStep, sampleStep);
+        estimate = estimatePropagationCost(renderRange, gridStep, sampleStep, originFactor);
       }
       return {
         gridStep,
@@ -655,6 +683,7 @@
 
     function isNodeCoveredByRaster(lat, lon, meta) {
       if (!meta) return false;
+      if (!meta.coverage) return false;
       if (lat < meta.latMin || lat > meta.latMax || lon < meta.lonMin || lon > meta.lonMax) {
         return false;
       }
@@ -666,6 +695,7 @@
 
     function listLikelyNodesFromRaster() {
       const matches = [];
+      if (!propagationOrigins.length) return matches;
       deviceMeta.forEach((meta, id) => {
         if (!meta || meta.lat == null || meta.lon == null) return;
         if (propagationOrigins.some((origin) => origin.id === id)) return;
@@ -712,9 +742,11 @@
       const clutterNote = config.model.clutterLossDb ? ` +${config.model.clutterLossDb} dB clutter` : '';
       const cutoffNote = config.autoRange ? ` • cutoff ${config.minRxDbm} dBm` : '';
       setPropRange(`Range: ${formatDistance(renderRange)} (base ${formatDistance(baseRange)} • ${config.model.label}${clutterNote}${cutoffNote})`);
-      const resolution = derivePropagationResolution(config, renderRange);
+      const originCount = propagationOrigins.length;
+      const resolution = derivePropagationResolution(config, renderRange, Math.max(1, originCount));
       const resLabel = config.autoResolution ? 'auto ' : '';
-      setPropCost(`Estimate: ${formatNumber(resolution.cells)} cells • ${formatNumber(resolution.samples)} samples (${resLabel}grid ${formatNumber(resolution.gridStep)}m • sample ${formatNumber(resolution.sampleStep)}m)`);
+      const originLabel = originCount > 1 ? ` • ${originCount} origins` : (originCount === 1 ? ' • 1 origin' : '');
+      setPropCost(`Estimate: ${formatNumber(resolution.cells)} cells • ${formatNumber(resolution.samples)} samples (${resLabel}grid ${formatNumber(resolution.gridStep)}m • sample ${formatNumber(resolution.sampleStep)}m${originLabel})`);
     }
 
     function markPropagationDirty(message) {
@@ -784,81 +816,114 @@
         'self.onmessage = async (event) => {',
         '  const data = event.data;',
         '  if (!data || data.type !== "render") return;',
-        '  const { token, origin, config, renderRange, maxPathLossDb, fspl1mDb, freqMHz } = data;',
+        '  const { token, origins, config, renderRange, maxPathLossDb, fspl1mDb, freqMHz } = data;',
         '  try {',
-        '    const lat0 = origin.lat;',
-        '    const lon0 = origin.lon;',
+        '    if (!Array.isArray(origins) || origins.length === 0) {',
+        '      throw new Error("No origins provided");',
+        '    }',
         '  const latScale = 111320;',
-        '  const lonScale = 111320 * Math.cos(lat0 * Math.PI / 180);',
+        '  const refLat = origins.reduce((sum, o) => sum + o.lat, 0) / origins.length;',
+        '  const lonScale = 111320 * Math.cos(refLat * Math.PI / 180);',
         '  const latStep = config.gridStep / latScale;',
         '  const lonStep = config.gridStep / lonScale;',
-        '  const latRadius = renderRange / latScale;',
-        '  const lonRadius = renderRange / lonScale;',
-        '  const latMax = lat0 + latRadius;',
-        '  const latMin = lat0 - latRadius;',
-        '  const lonMin = lon0 - lonRadius;',
-        '  const lonMax = lon0 + lonRadius;',
+        '  let latMin = Infinity;',
+        '  let latMax = -Infinity;',
+        '  let lonMin = Infinity;',
+        '  let lonMax = -Infinity;',
+        '  for (const origin of origins) {',
+        '    const originLonScale = 111320 * Math.cos(origin.lat * Math.PI / 180);',
+        '    const latRadius = renderRange / latScale;',
+        '    const lonRadius = renderRange / originLonScale;',
+        '    latMin = Math.min(latMin, origin.lat - latRadius);',
+        '    latMax = Math.max(latMax, origin.lat + latRadius);',
+        '    lonMin = Math.min(lonMin, origin.lon - lonRadius);',
+        '    lonMax = Math.max(lonMax, origin.lon + lonRadius);',
+        '  }',
         '  const rows = Math.max(1, Math.ceil((latMax - latMin) / latStep));',
         '  const cols = Math.max(1, Math.ceil((lonMax - lonMin) / lonStep));',
-        '  const zoom = clamp(Math.round(Math.log2(156543.03392 * Math.cos(lat0 * Math.PI / 180) / config.gridStep)), 8, 12);',
+        '  const zoom = clamp(Math.round(Math.log2(156543.03392 * Math.cos(refLat * Math.PI / 180) / config.gridStep)), 8, 12);',
         '  const lambda = 299792458 / (freqMHz * 1e6);',
         '  const clutterLossDb = Number.isFinite(config.clutterLossDb) ? config.clutterLossDb : 0;',
-        '  const originGround = config.useTerrain && config.txMsl == null ? await getElevation(lat0, lon0, zoom) : 0;',
-        '  const txAbs = (config.txMsl != null) ? config.txMsl : (originGround ?? 0) + config.txAgl;',
+        '  const originEntries = [];',
+        '  for (const origin of origins) {',
+        '    const originGround = config.useTerrain && config.txMsl == null ? await getElevation(origin.lat, origin.lon, zoom) : 0;',
+        '    const txAbs = (config.txMsl != null) ? config.txMsl : (originGround ?? 0) + config.txAgl;',
+        '    originEntries.push({',
+        '      lat: origin.lat,',
+        '      lon: origin.lon,',
+        '      lonScale: 111320 * Math.cos(origin.lat * Math.PI / 180),',
+        '      txAbs',
+        '    });',
+        '  }',
         '  const pixels = new Uint8ClampedArray(rows * cols * 4);',
-        '  const mask = new Uint8Array(rows * cols);',
+        '  const coverage = new Uint8Array(rows * cols);',
         '  for (let row = 0; row < rows; row++) {',
         '    const lat = latMax - row * latStep;',
         '    for (let col = 0; col < cols; col++) {',
         '      const lon = lonMin + col * lonStep;',
-        '      const dx = (lon - lon0) * lonScale;',
-        '      const dy = (lat - lat0) * latScale;',
-        '      const distance = Math.sqrt(dx * dx + dy * dy);',
         '      const idx = row * cols + col;',
         '      const offset = idx * 4;',
-        '      if (distance <= 1 || distance > renderRange) {',
-        '        pixels[offset + 3] = 0;',
-        '        continue;',
-        '      }',
-        '      let rxAbs = (config.rxMsl != null) ? config.rxMsl : txAbs;',
-        '      let maxV = 0;',
+        '      let bestMargin = -Infinity;',
+        '      let coverCount = 0;',
+        '      let endGround = null;',
         '      if (config.useTerrain) {',
-        '        const endGround = await getElevation(lat, lon, zoom);',
+        '        endGround = await getElevation(lat, lon, zoom);',
         '        if (endGround == null) {',
         '          pixels[offset + 3] = 0;',
         '          continue;',
         '        }',
-        '        rxAbs = (config.rxMsl != null) ? config.rxMsl : endGround + config.rxAgl;',
-        '        const samples = Math.max(2, Math.ceil(distance / config.sampleStep) + 1);',
-        '        for (let i = 1; i < samples - 1; i++) {',
-        '          const t = i / (samples - 1);',
-        '          const sLat = lat0 + (lat - lat0) * t;',
-        '          const sLon = lon0 + (lon - lon0) * t;',
-        '          const elev = await getElevation(sLat, sLon, zoom);',
-        '          if (elev == null) continue;',
-        '          const lineElev = txAbs + (rxAbs - txAbs) * t;',
-        '          const d1 = distance * t;',
-        '          const d2 = distance * (1 - t);',
-        '          let fresnel = 0;',
-        '          if (config.fresnelFactor > 0) {',
-        '            fresnel = config.fresnelFactor * Math.sqrt((lambda * d1 * d2) / (d1 + d2));',
+        '      }',
+        '      for (const origin of originEntries) {',
+        '        const dx = (lon - origin.lon) * origin.lonScale;',
+        '        const dy = (lat - origin.lat) * latScale;',
+        '        const distance = Math.sqrt(dx * dx + dy * dy);',
+        '        if (distance <= 1 || distance > renderRange) {',
+        '          continue;',
+        '        }',
+        '        let rxAbs = (config.rxMsl != null) ? config.rxMsl : (config.useTerrain ? endGround + config.rxAgl : origin.txAbs);',
+        '        let maxV = 0;',
+        '        if (config.useTerrain) {',
+        '          const samples = Math.max(2, Math.ceil(distance / config.sampleStep) + 1);',
+        '          for (let i = 1; i < samples - 1; i++) {',
+        '            const t = i / (samples - 1);',
+        '            const sLat = origin.lat + (lat - origin.lat) * t;',
+        '            const sLon = origin.lon + (lon - origin.lon) * t;',
+        '            const elev = await getElevation(sLat, sLon, zoom);',
+        '            if (elev == null) continue;',
+        '            const lineElev = origin.txAbs + (rxAbs - origin.txAbs) * t;',
+        '            const d1 = distance * t;',
+        '            const d2 = distance * (1 - t);',
+        '            let fresnel = 0;',
+        '            if (config.fresnelFactor > 0) {',
+        '              fresnel = config.fresnelFactor * Math.sqrt((lambda * d1 * d2) / (d1 + d2));',
+        '            }',
+        '            const obstruction = (elev - lineElev) - fresnel;',
+        '            if (obstruction <= 0) continue;',
+        '            const v = obstruction * Math.sqrt((2 * (d1 + d2)) / (lambda * d1 * d2));',
+        '            if (v > maxV) maxV = v;',
         '          }',
-        '          const obstruction = (elev - lineElev) - fresnel;',
-        '          if (obstruction <= 0) continue;',
-        '          const v = obstruction * Math.sqrt((2 * (d1 + d2)) / (lambda * d1 * d2));',
-        '          if (v > maxV) maxV = v;',
+        '        }',
+        '        const extraLoss = maxV > 0 ? knifeEdgeLossFromV(maxV) : 0;',
+        '        const pathLoss = fspl1mDb + (10 * config.pathLossExp * Math.log10(distance)) + extraLoss + clutterLossDb;',
+        '        const margin = maxPathLossDb - pathLoss;',
+        '        if (margin > 0) {',
+        '          coverCount += 1;',
+        '          if (margin > bestMargin) bestMargin = margin;',
         '        }',
         '      }',
-        '      const extraLoss = maxV > 0 ? knifeEdgeLossFromV(maxV) : 0;',
-        '      const pathLoss = fspl1mDb + (10 * config.pathLossExp * Math.log10(distance)) + extraLoss + clutterLossDb;',
-        '      const margin = maxPathLossDb - pathLoss;',
-        '      if (margin > 0) {',
-        '        const strength = Math.min(1, margin / 20);',
-        '        pixels[offset] = 239;',
-        '        pixels[offset + 1] = Math.round(68 + 60 * strength);',
-        '        pixels[offset + 2] = Math.round(68 + 20 * strength);',
-        '        pixels[offset + 3] = Math.round(255 * strength);',
-        '        mask[idx] = 1;',
+        '      if (coverCount > 0) {',
+        '        const strength = Math.min(1, bestMargin / 20);',
+        '        if (coverCount >= 2) {',
+        '          pixels[offset] = 34;',
+        '          pixels[offset + 1] = 197;',
+        '          pixels[offset + 2] = 94;',
+        '        } else {',
+        '          pixels[offset] = 239;',
+        '          pixels[offset + 1] = 68;',
+        '          pixels[offset + 2] = 68;',
+        '        }',
+        '        pixels[offset + 3] = config.fadeByMargin ? Math.round(255 * strength) : 255;',
+        '        coverage[idx] = Math.min(255, coverCount);',
         '      } else {',
         '        pixels[offset + 3] = 0;',
         '      }',
@@ -877,8 +942,8 @@
         '      latStep,',
         '      lonStep,',
         '      pixels: pixels.buffer,',
-        '      mask: mask.buffer',
-        '    }, [pixels.buffer, mask.buffer]);',
+        '      coverage: coverage.buffer',
+        '    }, [pixels.buffer, coverage.buffer]);',
         '  } catch (err) {',
         '    const message = (err && err.message) ? err.message : String(err);',
         '    self.postMessage({ type: "error", token, error: message });',
@@ -969,7 +1034,8 @@
       const baseRange = calcRangeMeters(maxPathLoss, PROP_DEFAULTS.freqMHz, config.model.n, config.model.clutterLossDb);
       propagationBaseRange = baseRange;
       const renderRange = config.autoRange ? baseRange : (baseRange * config.rangeFactor);
-      const resolution = derivePropagationResolution(config, renderRange);
+      const originCount = propagationOrigins.length;
+      const resolution = derivePropagationResolution(config, renderRange, originCount);
       propagationLastConfig = config;
       propagationOrigins.forEach((origin) => upsertPropagationOriginMarker(origin));
       updatePropagationSummary();
@@ -995,7 +1061,8 @@
           txAgl: config.txAgl,
           rxAgl: config.rxAgl,
           txMsl: config.txMsl,
-          rxMsl: config.rxMsl
+          rxMsl: config.rxMsl,
+          fadeByMargin: config.fadeMargin
         }
       });
     }
@@ -1003,25 +1070,38 @@
     function setPropagationOrigin(latlng, id = null) {
       if (!latlng) return;
       const meta = id ? deviceMeta.get(id) : null;
-      propagationOrigin = {
-        lat: latlng.lat,
-        lon: latlng.lng ?? latlng.lon,
-        id: id,
-        name: meta ? meta.name : null
-      };
-      if (propagationRaster) {
-        propagationLayer.removeLayer(propagationRaster);
-        propagationRaster = null;
+      const lat = latlng.lat;
+      const lon = latlng.lng ?? latlng.lon;
+      const multi = isMultiOriginEnabled();
+      if (!multi) {
+        clearPropagationOrigins();
       }
-      propagationRasterCanvas = null;
-      propagationRasterMeta = null;
-      if (propagationRenderInFlight) {
-        propagationComputeToken += 1;
-        propagationRenderInFlight = false;
+      let origin = null;
+      if (id) {
+        origin = propagationOrigins.find(item => item.id === id) || null;
       }
-      updatePropagationOriginMarker(propagationOrigin);
+      if (!origin && multi && !id) {
+        origin = propagationOrigins.find(item => item.lat === lat && item.lon === lon) || null;
+      }
+      if (!origin) {
+        origin = {
+          lat,
+          lon,
+          id,
+          key: id ? null : `manual-${Date.now()}-${propagationOriginSeq += 1}`,
+          name: meta ? meta.name : null
+        };
+        propagationOrigins.push(origin);
+      } else {
+        origin.lat = lat;
+        origin.lon = lon;
+        origin.name = meta ? meta.name : origin.name;
+      }
+      upsertPropagationOriginMarker(origin);
+      resetPropagationRaster();
       updatePropagationSummary();
-      markPropagationDirty('Origin set. Click "Render prop" to calculate coverage.');
+      const label = propagationOrigins.length === 1 ? 'Origin set.' : `${propagationOrigins.length} origins set.`;
+      markPropagationDirty(`${label} Click "Render prop" to calculate coverage.`);
     }
 
     function formatLastContact(tsSeconds) {
@@ -1067,7 +1147,7 @@
 
       // marker
       if (!markers.has(id)) {
-        const m = L.circleMarker(latlng, style).addTo(map);
+        const m = L.circleMarker(latlng, style).addTo(nodeLayer);
         m.bindPopup(makePopup(d), {
           maxWidth: 260,
           maxHeight: 320,
@@ -1115,7 +1195,7 @@
             weight: 3,
             opacity: 0.85,
             className: 'trail-animated'
-          }).addTo(map);
+          }).addTo(nodeLayer);
           polylines.set(id, pl);
         } else {
           const pl = polylines.get(id);
@@ -1125,27 +1205,19 @@
           }
         }
       } else if (polylines.has(id) && role === 'companion') {
-        map.removeLayer(polylines.get(id));
+        nodeLayer.removeLayer(polylines.get(id));
         polylines.delete(id);
       }
 
       setStats();
-      if (propagationActive && propagationOrigin) {
-        if (propagationOrigin.id === id) {
-          propagationOrigin.lat = d.lat;
-          propagationOrigin.lon = d.lon;
-          propagationOrigin.name = d.name || propagationOrigin.name;
-          updatePropagationOriginMarker(propagationOrigin);
-          if (propagationRaster) {
-            propagationLayer.removeLayer(propagationRaster);
-            propagationRaster = null;
-          }
-          propagationRasterCanvas = null;
-          propagationRasterMeta = null;
-          if (propagationRenderInFlight) {
-            propagationComputeToken += 1;
-            propagationRenderInFlight = false;
-          }
+      if (propagationActive && propagationOrigins.length) {
+        const origin = propagationOrigins.find(item => item.id === id);
+        if (origin) {
+          origin.lat = d.lat;
+          origin.lon = d.lon;
+          origin.name = d.name || origin.name;
+          upsertPropagationOriginMarker(origin);
+          resetPropagationRaster();
           updatePropagationSummary();
           markPropagationDirty('Origin moved. Click "Render prop" to update.');
           return;
@@ -1159,20 +1231,34 @@
     function removeDevices(ids) {
       ids.forEach(id => {
         if (markers.has(id)) {
-          map.removeLayer(markers.get(id));
+          nodeLayer.removeLayer(markers.get(id));
           markers.delete(id);
         }
         if (polylines.has(id)) {
-          map.removeLayer(polylines.get(id));
+          nodeLayer.removeLayer(polylines.get(id));
           polylines.delete(id);
         }
         deviceMeta.delete(id);
       });
       setStats();
-      if (propagationActive && propagationOrigin) {
-        if (ids.includes(propagationOrigin.id)) {
-          clearPropagation();
-          setPropStatus('Select a node or click the map to set a transmitter.');
+      if (propagationActive && propagationOrigins.length) {
+        const removed = propagationOrigins.filter(origin => origin.id && ids.includes(origin.id));
+        if (removed.length) {
+          removed.forEach((origin) => {
+            const key = getPropagationOriginKey(origin);
+            if (key && propagationOriginMarkers.has(key)) {
+              propagationLayer.removeLayer(propagationOriginMarkers.get(key));
+              propagationOriginMarkers.delete(key);
+            }
+          });
+          propagationOrigins = propagationOrigins.filter(origin => !(origin.id && ids.includes(origin.id)));
+          resetPropagationRaster();
+          updatePropagationSummary();
+          if (!propagationOrigins.length) {
+            setPropStatus('Select a node or click the map to set a transmitter.');
+          } else {
+            markPropagationDirty('Origin removed. Click "Render prop" to update.');
+          }
         } else {
           if (propagationRasterMeta && !propagationNeedsRender) {
             updatePropagationStatusFromRaster();
@@ -1497,6 +1583,20 @@
       });
     }
 
+    const nodesToggle = document.getElementById('nodes-toggle');
+    if (nodesToggle) {
+      const storedNodes = localStorage.getItem('meshmapNodesVisible');
+      if (storedNodes !== null) {
+        setNodesVisible(storedNodes === 'true');
+      } else {
+        setNodesVisible(true);
+      }
+      nodesToggle.addEventListener('click', () => {
+        setNodesVisible(!nodesVisible);
+        localStorage.setItem('meshmapNodesVisible', nodesVisible ? 'true' : 'false');
+      });
+    }
+
     const propToggle = document.getElementById('prop-toggle');
     const propTxInput = document.getElementById('prop-txpower');
     const propOpacityInput = document.getElementById('prop-opacity');
@@ -1509,6 +1609,7 @@
     const propMinRxInput = document.getElementById('prop-min-rx');
     const propAutoRangeInput = document.getElementById('prop-auto-range');
     const propMultiOriginInput = document.getElementById('prop-multi-origin');
+    const propFadeMarginInput = document.getElementById('prop-fade-margin');
     const propClearOriginsButton = document.getElementById('prop-clear-origins');
     const propAutoResInput = document.getElementById('prop-auto-res');
     const propMaxCellsInput = document.getElementById('prop-max-cells');
@@ -1644,7 +1745,19 @@
           markPropagationDirty('Multi-origin disabled. Keeping first origin only.');
         } else {
           markPropagationDirty();
+          if (propagationActive && propMultiOriginInput.checked && !propagationOrigins.length) {
+            setPropStatus('Multi-origin enabled. Click nodes or the map to add transmitters.');
+          }
         }
+      });
+    }
+
+    if (propFadeMarginInput) {
+      const storedFade = localStorage.getItem('meshmapPropFadeMargin');
+      if (storedFade !== null) propFadeMarginInput.checked = storedFade === 'true';
+      propFadeMarginInput.addEventListener('change', () => {
+        localStorage.setItem('meshmapPropFadeMargin', propFadeMarginInput.checked ? 'true' : 'false');
+        markPropagationDirty();
       });
     }
 
@@ -1724,8 +1837,9 @@
         setPropActive(!propagationActive);
         if (propagationActive) {
           updatePropagationSummary();
-          if (propagationOrigin) {
-            setPropStatus('Origin set. Click "Render prop" to calculate coverage.');
+          if (propagationOrigins.length) {
+            const label = propagationOrigins.length === 1 ? 'Origin set.' : `${propagationOrigins.length} origins set.`;
+            setPropStatus(`${label} Click "Render prop" to calculate coverage.`);
           }
         }
       });
