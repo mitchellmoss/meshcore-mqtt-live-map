@@ -1715,7 +1715,7 @@ def get_stats():
 
 
 @app.get("/los")
-def line_of_sight(lat1: float, lon1: float, lat2: float, lon2: float, profile: bool = False):
+def line_of_sight(lat1: float, lon1: float, lat2: float, lon2: float):
   start = _normalize_lat_lon(lat1, lon1)
   end = _normalize_lat_lon(lat2, lon2)
   if not start or not end:
@@ -1737,7 +1737,7 @@ def line_of_sight(lat1: float, lon1: float, lat2: float, lon2: float, profile: b
   blocked = max_obstruction > 0.0
   suggestion = _find_los_suggestion(points, elevations) if blocked else None
 
-  response = {
+  return {
     "ok": True,
     "blocked": blocked,
     "max_obstruction_m": round(max_obstruction, 2),
@@ -1754,12 +1754,6 @@ def line_of_sight(lat1: float, lon1: float, lat2: float, lon2: float, profile: b
     "note": "Straight-line LOS using SRTM90m. No curvature/refraction.",
     "suggested": suggestion,
   }
-  if profile:
-    response["profile"] = [
-      [round(lat, 6), round(lon, 6), round(t, 4), round(float(elev), 2)]
-      for (lat, lon, t), elev in zip(points, elevations)
-    ]
-  return response
 
 
 @app.get("/debug/last")
