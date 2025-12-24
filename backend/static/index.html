@@ -101,9 +101,9 @@
     <div class="small">Markers update in real time. Trails show last ~50 points.</div>
     <div class="small">{{SITE_FEED_NOTE}}</div>
     <div class="small" id="stats"></div>
+    <button class="legend-toggle" id="legend-toggle" type="button">Hide legend</button>
     <button class="map-toggle" id="map-toggle" type="button">Dark map</button>
     <button class="map-toggle" id="topo-toggle" type="button">Topo map</button>
-    <button class="legend-toggle" id="legend-toggle" type="button">Hide legend</button>
     <div class="legend">
       <div class="legend-item"><span class="legend-line legend-trace"></span> Trace/path</div>
       <div class="legend-item"><span class="legend-line legend-message"></span> Message</div>
@@ -451,9 +451,15 @@
     const legendToggle = document.getElementById('legend-toggle');
     const hud = document.querySelector('.hud');
     if (legendToggle && hud) {
+      const storedLegend = localStorage.getItem('meshmapLegendCollapsed');
+      if (storedLegend === 'true') {
+        hud.classList.add('legend-collapsed');
+        legendToggle.textContent = 'Show legend';
+      }
       legendToggle.addEventListener('click', () => {
         const collapsed = hud.classList.toggle('legend-collapsed');
         legendToggle.textContent = collapsed ? 'Show legend' : 'Hide legend';
+        localStorage.setItem('meshmapLegendCollapsed', collapsed ? 'true' : 'false');
       });
     }
 
