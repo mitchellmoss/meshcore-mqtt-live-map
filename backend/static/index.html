@@ -188,7 +188,7 @@
     <div class="prop-panel" id="prop-panel">
       <div class="small"><strong>Propagation estimate</strong></div>
       <div class="small">LoRa 910.525 MHz • BW 62.5 kHz • SF7 • CR8</div>
-      <div class="small">Assumes 6 dB noise figure and 10 dB fade margin.</div>
+    <div class="small">Assumes 3 dBi TX antenna, 6 dB noise figure, 10 dB fade margin.</div>
       <div class="small">Defaults assume 5 m AGL; MSL overrides use terrain data.</div>
       <label class="prop-field">
         <span>Tx power (dBm)<span class="prop-hint" title="transmit power used for link budget" data-tooltip="transmit power used for link budget">?</span></span>
@@ -363,7 +363,11 @@
       snrMinDb: -7.5,
       noiseFigureDb: 6,
       fadeMarginDb: 10,
-      fresnelFactor: 0.2
+      fresnelFactor: 0.2,
+      txAntennaGainDb: 3,
+      clearanceRatio: 0.6,
+      clearanceLossDb: 12,
+      earthRadiusM: 6371000 * (4 / 3)
     };
 
     const PROP_TERRARIUM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
@@ -742,9 +746,10 @@
         PROP_DEFAULTS.noiseFigureDb,
         PROP_DEFAULTS.snrMinDb
       );
+      const effectiveTxPower = config.txPower + PROP_DEFAULTS.txAntennaGainDb;
       const maxPathLoss = config.autoRange
-        ? (config.txPower - config.minRxDbm)
-        : calcMaxPathLossDb(config.txPower, sensitivity, PROP_DEFAULTS.fadeMarginDb);
+        ? (effectiveTxPower - config.minRxDbm)
+        : calcMaxPathLossDb(effectiveTxPower, sensitivity, PROP_DEFAULTS.fadeMarginDb);
       const baseRange = calcRangeMeters(maxPathLoss, PROP_DEFAULTS.freqMHz, config.model.n, config.model.clutterLossDb);
       propagationBaseRange = baseRange;
       const renderRange = config.autoRange ? baseRange : (baseRange * config.rangeFactor);
@@ -891,6 +896,7 @@
         '        }',
         '        let rxAbs = (config.rxMsl != null) ? config.rxMsl : (config.useTerrain ? endGround + config.rxAgl : origin.txAbs);',
         '        let maxV = 0;',
+        '        let minClearanceRatio = Infinity;',
         '        if (config.useTerrain) {',
         '          const samples = Math.max(2, Math.ceil(distance / config.sampleStep) + 1);',
         '          for (let i = 1; i < samples - 1; i++) {',
@@ -902,18 +908,32 @@
         '            const lineElev = origin.txAbs + (rxAbs - origin.txAbs) * t;',
         '            const d1 = distance * t;',
         '            const d2 = distance * (1 - t);',
+        '            const f1 = Math.sqrt((lambda * d1 * d2) / (d1 + d2));',
+        '            const bulge = (d1 * d2) / (2 * config.earthRadiusM);',
+        '            const effectiveElev = elev + bulge;',
         '            let fresnel = 0;',
         '            if (config.fresnelFactor > 0) {',
-        '              fresnel = config.fresnelFactor * Math.sqrt((lambda * d1 * d2) / (d1 + d2));',
+        '              fresnel = config.fresnelFactor * f1;',
         '            }',
-        '            const obstruction = (elev - lineElev) - fresnel;',
+        '            const clearance = lineElev - effectiveElev;',
+        '            if (f1 > 0) {',
+        '              const ratio = clearance / f1;',
+        '              if (ratio < minClearanceRatio) minClearanceRatio = ratio;',
+        '            }',
+        '            const obstruction = (effectiveElev - lineElev) - fresnel;',
         '            if (obstruction <= 0) continue;',
         '            const v = obstruction * Math.sqrt((2 * (d1 + d2)) / (lambda * d1 * d2));',
         '            if (v > maxV) maxV = v;',
         '          }',
         '        }',
         '        const extraLoss = maxV > 0 ? knifeEdgeLossFromV(maxV) : 0;',
-        '        const pathLoss = fspl1mDb + (10 * config.pathLossExp * Math.log10(distance)) + extraLoss + clutterLossDb;',
+        '        let clearanceLoss = 0;',
+        '        if (config.useTerrain && Number.isFinite(minClearanceRatio) && minClearanceRatio < config.clearanceRatio) {',
+        '          const ratio = Math.max(-1, minClearanceRatio);',
+        '          const deficit = config.clearanceRatio - ratio;',
+        '          clearanceLoss = Math.min(config.clearanceLossDb, (deficit / config.clearanceRatio) * config.clearanceLossDb);',
+        '        }',
+        '        const pathLoss = fspl1mDb + (10 * config.pathLossExp * Math.log10(distance)) + extraLoss + clearanceLoss + clutterLossDb;',
         '        const margin = maxPathLossDb - pathLoss;',
         '        if (margin > 0) {',
         '          coverCount += 1;',
@@ -921,8 +941,9 @@
         '        }',
         '      }',
         '      if (coverCount > 0) {',
+        '        const requiredOverlap = originEntries.length >= 3 ? originEntries.length : 2;',
         '        const strength = Math.min(1, bestMargin / 20);',
-        '        if (coverCount >= 2) {',
+        '        if (coverCount >= requiredOverlap) {',
         '          pixels[offset] = 34;',
         '          pixels[offset + 1] = 197;',
         '          pixels[offset + 2] = 94;',
@@ -1100,7 +1121,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = (row * cols + col) * 4u;
   if (coverCount > 0u) {
     let strength = clamp(bestMargin / 20.0, 0.0, 1.0);
-    if (coverCount >= 2u) {
+    var required: u32 = 2u;
+    if (originCount >= 3u) {
+      required = originCount;
+    }
+    if (coverCount >= required) {
       outPixels[idx] = 34u;
       outPixels[idx + 1u] = 197u;
       outPixels[idx + 2u] = 94u;
@@ -1322,9 +1347,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         PROP_DEFAULTS.noiseFigureDb,
         PROP_DEFAULTS.snrMinDb
       );
+      const effectiveTxPower = config.txPower + PROP_DEFAULTS.txAntennaGainDb;
       const maxPathLoss = config.autoRange
-        ? (config.txPower - config.minRxDbm)
-        : calcMaxPathLossDb(config.txPower, sensitivity, PROP_DEFAULTS.fadeMarginDb);
+        ? (effectiveTxPower - config.minRxDbm)
+        : calcMaxPathLossDb(effectiveTxPower, sensitivity, PROP_DEFAULTS.fadeMarginDb);
       const baseRange = calcRangeMeters(maxPathLoss, PROP_DEFAULTS.freqMHz, config.model.n, config.model.clutterLossDb);
       propagationBaseRange = baseRange;
       const renderRange = config.autoRange ? baseRange : (baseRange * config.rangeFactor);
@@ -1372,6 +1398,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           clutterLossDb: config.model.clutterLossDb,
           useTerrain: config.terrain,
           fresnelFactor: PROP_DEFAULTS.fresnelFactor,
+          clearanceRatio: PROP_DEFAULTS.clearanceRatio,
+          clearanceLossDb: PROP_DEFAULTS.clearanceLossDb,
+          earthRadiusM: PROP_DEFAULTS.earthRadiusM,
           txAgl: config.txAgl,
           rxAgl: config.rxAgl,
           txMsl: config.txMsl,
