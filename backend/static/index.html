@@ -243,6 +243,10 @@
         <span>Fade by margin<span class="prop-hint" title="fade coverage by link margin strength" data-tooltip="fade coverage by link margin strength">?</span></span>
         <input id="prop-fade-margin" type="checkbox" />
       </label>
+      <label class="prop-field">
+        <span>WebGPU (experimental)<span class="prop-hint" title="GPU-accelerated render (terrain off)" data-tooltip="GPU-accelerated render (terrain off)">?</span></span>
+        <input id="prop-webgpu" type="checkbox" />
+      </label>
       <button class="map-toggle" id="prop-clear-origins" type="button">Clear origins</button>
       <label class="prop-field">
         <span>Auto resolution<span class="prop-hint" title="scale grid to stay within target cells" data-tooltip="scale grid to stay within target cells">?</span></span>
@@ -348,6 +352,8 @@
     let propagationComputeToken = 0;
     let propagationWorker = null;
     let propagationLastConfig = null;
+    let propagationGpu = null;
+    let propagationGpuInitPromise = null;
 
     const PROP_DEFAULTS = {
       freqMHz: 910.525,
@@ -570,12 +576,13 @@
       const minRxInput = document.getElementById('prop-min-rx');
       const autoRangeInput = document.getElementById('prop-auto-range');
       const fadeMarginInput = document.getElementById('prop-fade-margin');
+      const webGpuInput = document.getElementById('prop-webgpu');
       const autoResInput = document.getElementById('prop-auto-res');
       const maxCellsInput = document.getElementById('prop-max-cells');
       const gridInput = document.getElementById('prop-grid');
       const sampleInput = document.getElementById('prop-sample');
       const rangeFactorInput = document.getElementById('prop-range-factor');
-      if (!txInput || !opacityInput || !modelSelect || !terrainInput || !txAglInput || !rxAglInput || !txMslInput || !rxMslInput || !minRxInput || !autoRangeInput || !fadeMarginInput || !autoResInput || !maxCellsInput || !gridInput || !sampleInput || !rangeFactorInput) {
+      if (!txInput || !opacityInput || !modelSelect || !terrainInput || !txAglInput || !rxAglInput || !txMslInput || !rxMslInput || !minRxInput || !autoRangeInput || !fadeMarginInput || !webGpuInput || !autoResInput || !maxCellsInput || !gridInput || !sampleInput || !rangeFactorInput) {
         return null;
       }
       const txPower = Number(txInput.value);
@@ -589,6 +596,7 @@
       const minRxDbm = Number(minRxInput.value);
       const autoRange = autoRangeInput.checked;
       const fadeMargin = fadeMarginInput.checked;
+      const useWebGpu = webGpuInput.checked && !webGpuInput.disabled;
       const autoResolution = autoResInput.checked;
       const maxCells = Number(maxCellsInput.value);
       const gridStep = Number(gridInput.value);
@@ -608,6 +616,7 @@
         minRxDbm: Number.isFinite(minRxDbm) ? Math.min(-60, Math.max(-150, minRxDbm)) : -97,
         autoRange,
         fadeMargin,
+        useWebGpu,
         autoResolution,
         maxCells: Number.isFinite(maxCells) ? Math.min(500000, Math.max(20000, maxCells)) : 120000,
         txMsl,
@@ -1011,7 +1020,292 @@
       return propagationWorker;
     }
 
-    function renderPropagationRaster() {
+    async function ensurePropagationGpu() {
+      if (propagationGpu) return propagationGpu;
+      if (!navigator.gpu) return null;
+      if (propagationGpuInitPromise) return propagationGpuInitPromise;
+      propagationGpuInitPromise = (async () => {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) return null;
+          const device = await adapter.requestDevice();
+          const module = device.createShaderModule({
+            code: `
+struct Params {
+  latMin: f32,
+  latMax: f32,
+  lonMin: f32,
+  lonMax: f32,
+  latStep: f32,
+  lonStep: f32,
+  latScale: f32,
+  renderRange: f32,
+  fspl1mDb: f32,
+  maxPathLossDb: f32,
+  pathLossExp: f32,
+  clutterLossDb: f32,
+  fadeByMargin: f32,
+  originCount: f32,
+  rows: f32,
+  cols: f32,
+};
+
+struct Origin {
+  lat: f32,
+  lon: f32,
+  lonScale: f32,
+  _pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> origins: array<Origin>;
+@group(0) @binding(2) var<storage, read_write> outPixels: array<u32>;
+@group(0) @binding(3) var<storage, read_write> outCoverage: array<u32>;
+
+fn log10(x: f32) -> f32 {
+  return log2(x) / 3.321928;
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let row = gid.y;
+  let col = gid.x;
+  let rows = u32(params.rows + 0.5);
+  let cols = u32(params.cols + 0.5);
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  let lat = params.latMax - f32(row) * params.latStep;
+  let lon = params.lonMin + f32(col) * params.lonStep;
+  var bestMargin = -1e9;
+  var coverCount: u32 = 0u;
+  let originCount = u32(params.originCount + 0.5);
+  for (var i: u32 = 0u; i < originCount; i = i + 1u) {
+    let origin = origins[i];
+    let dx = (lon - origin.lon) * origin.lonScale;
+    let dy = (lat - origin.lat) * params.latScale;
+    let distance = sqrt(dx * dx + dy * dy);
+    if (distance <= 1.0 || distance > params.renderRange) {
+      continue;
+    }
+    let pathLoss = params.fspl1mDb + 10.0 * params.pathLossExp * log10(distance) + params.clutterLossDb;
+    let margin = params.maxPathLossDb - pathLoss;
+    if (margin > 0.0) {
+      coverCount = coverCount + 1u;
+      if (margin > bestMargin) {
+        bestMargin = margin;
+      }
+    }
+  }
+  let idx = (row * cols + col) * 4u;
+  if (coverCount > 0u) {
+    let strength = clamp(bestMargin / 20.0, 0.0, 1.0);
+    if (coverCount >= 2u) {
+      outPixels[idx] = 34u;
+      outPixels[idx + 1u] = 197u;
+      outPixels[idx + 2u] = 94u;
+    } else {
+      outPixels[idx] = 239u;
+      outPixels[idx + 1u] = 68u;
+      outPixels[idx + 2u] = 68u;
+    }
+    var alpha = 255.0;
+    if (params.fadeByMargin > 0.5) {
+      alpha = 255.0 * strength;
+    }
+    outPixels[idx + 3u] = u32(alpha);
+    outCoverage[row * cols + col] = coverCount;
+  } else {
+    outPixels[idx + 3u] = 0u;
+    outCoverage[row * cols + col] = 0u;
+  }
+}
+            `
+          });
+          const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module, entryPoint: 'main' }
+          });
+          propagationGpu = { device, pipeline };
+          return propagationGpu;
+        } catch (err) {
+          propagationGpu = null;
+          return null;
+        } finally {
+          propagationGpuInitPromise = null;
+        }
+      })();
+      return propagationGpuInitPromise;
+    }
+
+    async function renderPropagationRasterWebGpu({
+      token,
+      origins,
+      config,
+      renderRange,
+      maxPathLossDb,
+      resolution
+    }) {
+      try {
+        const gpu = await ensurePropagationGpu();
+        if (!gpu) return false;
+        const { device, pipeline } = gpu;
+        const latScale = 111320;
+        const refLat = origins.reduce((sum, origin) => sum + origin.lat, 0) / origins.length;
+        const lonScale = 111320 * Math.cos(refLat * (Math.PI / 180));
+        const latStep = resolution.gridStep / latScale;
+        const lonStep = resolution.gridStep / lonScale;
+        let latMin = Infinity;
+        let latMax = -Infinity;
+        let lonMin = Infinity;
+        let lonMax = -Infinity;
+        origins.forEach((origin) => {
+          const originLonScale = 111320 * Math.cos(origin.lat * (Math.PI / 180));
+          const latRadius = renderRange / latScale;
+          const lonRadius = renderRange / originLonScale;
+          latMin = Math.min(latMin, origin.lat - latRadius);
+          latMax = Math.max(latMax, origin.lat + latRadius);
+          lonMin = Math.min(lonMin, origin.lon - lonRadius);
+          lonMax = Math.max(lonMax, origin.lon + lonRadius);
+        });
+        const rows = Math.max(1, Math.ceil((latMax - latMin) / latStep));
+        const cols = Math.max(1, Math.ceil((lonMax - lonMin) / lonStep));
+        const cellCount = rows * cols;
+        const params = new Float32Array([
+          latMin,
+          latMax,
+          lonMin,
+          lonMax,
+          latStep,
+          lonStep,
+          latScale,
+          renderRange,
+          calcFsplAt1mDb(PROP_DEFAULTS.freqMHz),
+          maxPathLossDb,
+          config.model.n,
+          config.model.clutterLossDb,
+          config.fadeMargin ? 1 : 0,
+          origins.length,
+          rows,
+          cols
+        ]);
+        const originData = new Float32Array(origins.length * 4);
+        origins.forEach((origin, idx) => {
+          const offset = idx * 4;
+          originData[offset] = origin.lat;
+          originData[offset + 1] = origin.lon;
+          originData[offset + 2] = 111320 * Math.cos(origin.lat * (Math.PI / 180));
+          originData[offset + 3] = 0;
+        });
+        const paramsBuffer = device.createBuffer({
+          size: params.byteLength,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
+        device.queue.writeBuffer(paramsBuffer, 0, params);
+        const originsBuffer = device.createBuffer({
+          size: originData.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        device.queue.writeBuffer(originsBuffer, 0, originData);
+        const pixelBufferSize = cellCount * 4 * 4;
+        const coverageBufferSize = cellCount * 4;
+        const pixelBuffer = device.createBuffer({
+          size: pixelBufferSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        const coverageBuffer = device.createBuffer({
+          size: coverageBufferSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+        const pixelReadBuffer = device.createBuffer({
+          size: pixelBufferSize,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        });
+        const coverageReadBuffer = device.createBuffer({
+          size: coverageBufferSize,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+        });
+        const bindGroup = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } },
+            { binding: 1, resource: { buffer: originsBuffer } },
+            { binding: 2, resource: { buffer: pixelBuffer } },
+            { binding: 3, resource: { buffer: coverageBuffer } }
+          ]
+        });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(cols / 8), Math.ceil(rows / 8));
+        pass.end();
+        encoder.copyBufferToBuffer(pixelBuffer, 0, pixelReadBuffer, 0, pixelBufferSize);
+        encoder.copyBufferToBuffer(coverageBuffer, 0, coverageReadBuffer, 0, coverageBufferSize);
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+        if (token !== propagationComputeToken) return true;
+        await pixelReadBuffer.mapAsync(GPUMapMode.READ);
+        await coverageReadBuffer.mapAsync(GPUMapMode.READ);
+        const pixelCopy = pixelReadBuffer.getMappedRange();
+        const coverageCopy = coverageReadBuffer.getMappedRange();
+        const pixelU32 = new Uint32Array(pixelCopy);
+        const coverageU32 = new Uint32Array(coverageCopy);
+        const pixels = new Uint8ClampedArray(pixelU32.length);
+        for (let i = 0; i < pixelU32.length; i++) {
+          pixels[i] = pixelU32[i];
+        }
+        const coverage = new Uint8Array(coverageU32.length);
+        for (let i = 0; i < coverageU32.length; i++) {
+          coverage[i] = Math.min(255, coverageU32[i]);
+        }
+        pixelReadBuffer.unmap();
+        coverageReadBuffer.unmap();
+        if (token !== propagationComputeToken) return true;
+        const canvas = document.createElement('canvas');
+        canvas.width = cols;
+        canvas.height = rows;
+        const ctx = canvas.getContext('2d');
+        const imageData = new ImageData(pixels, cols, rows);
+        ctx.putImageData(imageData, 0, 0);
+        propagationRasterCanvas = canvas;
+        const dataUrl = canvas.toDataURL('image/png');
+        const bounds = [
+          [latMin, lonMin],
+          [latMax, lonMax]
+        ];
+        if (!propagationRaster) {
+          propagationRaster = L.imageOverlay(dataUrl, bounds, { opacity: propagationLastConfig?.opacity ?? 0.2 }).addTo(propagationLayer);
+        } else {
+          propagationRaster.setUrl(dataUrl);
+          propagationRaster.setBounds(bounds);
+        }
+        if (propagationRaster && propagationLastConfig) {
+          propagationRaster.setOpacity(propagationLastConfig.opacity);
+        }
+        propagationRasterMeta = {
+          latMin,
+          latMax,
+          lonMin,
+          lonMax,
+          latStep,
+          lonStep,
+          rows,
+          cols,
+          coverage
+        };
+        propagationRenderInFlight = false;
+        propagationNeedsRender = false;
+        if (propagationOrigins.length) {
+          updatePropagationStatusFromRaster();
+        }
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    async function renderPropagationRaster() {
       if (!propagationActive) return;
       const config = getPropagationConfig();
       if (!config) return;
@@ -1041,12 +1335,32 @@
       updatePropagationSummary();
       propagationComputeToken += 1;
       propagationRenderInFlight = true;
-      setPropStatus('Rendering: 0%');
+      const token = propagationComputeToken;
+      const origins = propagationOrigins.map((origin) => ({ lat: origin.lat, lon: origin.lon }));
+      if (config.useWebGpu && !config.terrain) {
+        setPropStatus('Rendering (WebGPU): 0%');
+        const ok = await renderPropagationRasterWebGpu({
+          token,
+          origins,
+          config,
+          renderRange,
+          maxPathLossDb: maxPathLoss,
+          resolution
+        });
+        if (ok) return;
+        if (token === propagationComputeToken) {
+          setPropStatus('WebGPU unavailable. Falling back to CPU...');
+        }
+      } else if (config.useWebGpu && config.terrain) {
+        setPropStatus('WebGPU experimental only supports terrain off. Using CPU...');
+      } else {
+        setPropStatus('Rendering: 0%');
+      }
       ensurePropagationWorker();
       propagationWorker.postMessage({
         type: 'render',
-        token: propagationComputeToken,
-        origins: propagationOrigins.map((origin) => ({ lat: origin.lat, lon: origin.lon })),
+        token,
+        origins,
         renderRange,
         maxPathLossDb: maxPathLoss,
         fspl1mDb: calcFsplAt1mDb(PROP_DEFAULTS.freqMHz),
@@ -1610,6 +1924,7 @@
     const propAutoRangeInput = document.getElementById('prop-auto-range');
     const propMultiOriginInput = document.getElementById('prop-multi-origin');
     const propFadeMarginInput = document.getElementById('prop-fade-margin');
+    const propWebGpuInput = document.getElementById('prop-webgpu');
     const propClearOriginsButton = document.getElementById('prop-clear-origins');
     const propAutoResInput = document.getElementById('prop-auto-res');
     const propMaxCellsInput = document.getElementById('prop-max-cells');
@@ -1758,6 +2073,21 @@
       propFadeMarginInput.addEventListener('change', () => {
         localStorage.setItem('meshmapPropFadeMargin', propFadeMarginInput.checked ? 'true' : 'false');
         markPropagationDirty();
+      });
+    }
+
+    if (propWebGpuInput) {
+      const supported = !!navigator.gpu;
+      propWebGpuInput.disabled = !supported;
+      const storedWebGpu = localStorage.getItem('meshmapPropWebGpu');
+      if (storedWebGpu !== null) propWebGpuInput.checked = storedWebGpu === 'true';
+      if (!supported) propWebGpuInput.checked = false;
+      propWebGpuInput.addEventListener('change', () => {
+        localStorage.setItem('meshmapPropWebGpu', propWebGpuInput.checked ? 'true' : 'false');
+        markPropagationDirty();
+        if (propagationActive && propWebGpuInput.checked && !supported) {
+          setPropStatus('WebGPU not supported in this browser.');
+        }
       });
     }
 
